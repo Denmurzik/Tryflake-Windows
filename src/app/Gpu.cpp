@@ -123,14 +123,21 @@ bool GpuContext::create(std::wstring& error) {
         error = L"Не удалось создать устройство Direct3D 11: " + hrMessage(hr);
         return false;
     }
-    device.As(&dxgiDevice);
-    dxgiDevice->SetMaximumFrameLatency(1);
+    if (FAILED(hr = device.As(&dxgiDevice))) {
+        error = L"Не удалось получить DXGI-устройство: " + hrMessage(hr);
+        destroy();
+        return false;
+    }
+    dxgiDevice->SetMaximumFrameLatency(2);  // 1 блокировал бы UI-поток при нескольких оверлеях (Present(0) ждёт слот кадра)
     ComPtr<IDXGIAdapter> adapter;
-    dxgiDevice->GetAdapter(&adapter);
     DXGI_ADAPTER_DESC desc{};
-    adapter->GetDesc(&desc);
+    if (FAILED(hr = dxgiDevice->GetAdapter(&adapter)) || FAILED(hr = adapter->GetDesc(&desc)) ||
+        FAILED(hr = adapter->GetParent(IID_PPV_ARGS(&factory)))) {
+        error = L"Не удалось получить видеоадаптер: " + hrMessage(hr);
+        destroy();
+        return false;
+    }
     adapterName = desc.Description;
-    adapter->GetParent(IID_PPV_ARGS(&factory));
 
     if (FAILED(hr = DCompositionCreateDevice(dxgiDevice.Get(), IID_PPV_ARGS(&dcomp)))) {
         error = L"DirectComposition недоступен: " + hrMessage(hr);
@@ -161,7 +168,11 @@ bool GpuContext::create(std::wstring& error) {
         {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 32, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
-    device->CreateInputLayout(elements, ARRAYSIZE(elements), g_vsMain, sizeof(g_vsMain), &layout_);
+    if (FAILED(hr = device->CreateInputLayout(elements, ARRAYSIZE(elements), g_vsMain, sizeof(g_vsMain), &layout_))) {
+        error = L"Не удалось создать входной layout: " + hrMessage(hr);
+        destroy();
+        return false;
+    }
 
     D3D11_BLEND_DESC blend{};
     blend.RenderTarget[0].BlendEnable = TRUE;
@@ -172,20 +183,32 @@ bool GpuContext::create(std::wstring& error) {
     blend.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
     blend.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    device->CreateBlendState(&blend, &blend_);
+    if (FAILED(hr = device->CreateBlendState(&blend, &blend_))) {
+        error = L"Не удалось создать состояние смешивания: " + hrMessage(hr);
+        destroy();
+        return false;
+    }
 
     D3D11_RASTERIZER_DESC raster{};
     raster.FillMode = D3D11_FILL_SOLID;
     raster.CullMode = D3D11_CULL_NONE;
     raster.DepthClipEnable = TRUE;
-    device->CreateRasterizerState(&raster, &raster_);
+    if (FAILED(hr = device->CreateRasterizerState(&raster, &raster_))) {
+        error = L"Не удалось создать состояние растеризатора: " + hrMessage(hr);
+        destroy();
+        return false;
+    }
 
     D3D11_BUFFER_DESC cb{};
     cb.ByteWidth = 16;
     cb.Usage = D3D11_USAGE_DYNAMIC;
     cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    device->CreateBuffer(&cb, nullptr, &constants_);
+    if (FAILED(hr = device->CreateBuffer(&cb, nullptr, &constants_))) {
+        error = L"Не удалось создать буфер констант: " + hrMessage(hr);
+        destroy();
+        return false;
+    }
     return true;
 }
 
@@ -210,7 +233,14 @@ void GpuContext::destroy() {
     device.Reset();
 }
 
-bool GpuContext::deviceLost() const { return device && FAILED(device->GetDeviceRemovedReason()); }
+bool GpuContext::deviceLost() const {
+    if (device && FAILED(device->GetDeviceRemovedReason())) return true;
+    if (dcomp) {
+        BOOL valid = TRUE;
+        if (SUCCEEDED(dcomp->CheckDeviceState(&valid)) && !valid) return true;
+    }
+    return false;
+}
 
 void GpuContext::draw(ID3D11RenderTargetView* rtv, UINT pixelWidth, UINT pixelHeight, float viewportWidth,
                       float viewportHeight, const std::vector<GpuVertex>& vertices, const float clear[4]) {

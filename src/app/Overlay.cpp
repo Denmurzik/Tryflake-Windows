@@ -51,9 +51,12 @@ Overlay::Overlay(GpuContext& gpu, SettingsStore& settings, const MonitorInfo& mo
     desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
     if (FAILED(gpu_.factory->CreateSwapChainForComposition(gpu_.device.Get(), &desc, nullptr, &swapChain_))) return;
     ComPtr<ID3D11Texture2D> buffer;
-    swapChain_->GetBuffer(0, IID_PPV_ARGS(&buffer));
-    gpu_.device->CreateRenderTargetView(buffer.Get(), nullptr, &rtv_);
-    if (FAILED(gpu_.dcomp->CreateTargetForHwnd(hwnd_, TRUE, &target_)) || FAILED(gpu_.dcomp->CreateVisual(&visual_))) {
+    if (FAILED(swapChain_->GetBuffer(0, IID_PPV_ARGS(&buffer))) ||
+        FAILED(gpu_.device->CreateRenderTargetView(buffer.Get(), nullptr, &rtv_)) ||
+        FAILED(gpu_.dcomp->CreateTargetForHwnd(hwnd_, TRUE, &target_)) || FAILED(gpu_.dcomp->CreateVisual(&visual_))) {
+        rtv_.Reset();
+        target_.Reset();
+        visual_.Reset();
         swapChain_.Reset();
         return;
     }
@@ -73,6 +76,11 @@ Overlay::~Overlay() {
     visual_.Reset();
     target_.Reset();
     swapChain_.Reset();
+    // Без Flush драйвер держит ссылки на буферы удалённой цепочки до следующего кадра.
+    if (gpu_.context) {
+        gpu_.context->ClearState();
+        gpu_.context->Flush();
+    }
 }
 
 void Overlay::applySettings(bool sleeping) {
@@ -106,6 +114,12 @@ void Overlay::updateSnapshot(const DesktopSnapshot& snapshot) {
 void Overlay::keepOnTop(HWND below) {
     if (!visible_) return;
     // Остаёмся поверх обычных окон, но под панелью настроек.
+    // Уже на месте — не дёргаем Z-порядок (каждый SetWindowPos шлёт сообщения другим окнам).
+    if (below) {
+        if (GetWindow(hwnd_, GW_HWNDPREV) == below) return;
+    } else if (!GetWindow(hwnd_, GW_HWNDPREV) && (GetWindowLongPtrW(hwnd_, GWL_EXSTYLE) & WS_EX_TOPMOST)) {
+        return;
+    }
     SetWindowPos(hwnd_, below ? below : HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING);
 }
@@ -142,7 +156,7 @@ bool Overlay::frame(double now) {
 }
 
 bool Overlay::render() {
-    if (!swapChain_) return true;
+    if (!swapChain_ || !rtv_) return true;
     SnowMesh::build(world_, settings_.prefs.opacity, vertices_);
     const float clear[4] = {0, 0, 0, 0};
     gpu_.draw(rtv_.Get(), pixelWidth_, pixelHeight_, static_cast<float>(world_.width),
@@ -157,6 +171,9 @@ void Overlay::setClickThrough(bool through) {
     LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
     ex = through ? (ex | WS_EX_TRANSPARENT) : (ex & ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT));
     SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex);
+    // Курсор не двигался — Windows сам не пошлёт WM_SETCURSOR, поэтому обновляем вручную.
+    POINT cursor{};
+    if (GetCursorPos(&cursor) && WindowFromPoint(cursor) == hwnd_) SendMessageW(hwnd_, WM_SETCURSOR, reinterpret_cast<WPARAM>(hwnd_), MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
 }
 
 Point Overlay::toLocal(LPARAM lParam) const {

@@ -14,7 +14,7 @@ public:
     Overlay(const Overlay&) = delete;
     Overlay& operator=(const Overlay&) = delete;
 
-    bool ok() const { return hwnd_ && swapChain_; }
+    bool ok() const { return hwnd_ && swapChain_ && rtv_; }
     HWND hwnd() const { return hwnd_; }
     const MonitorInfo& monitor() const { return monitor_; }
     snow::SnowWorld& world() { return world_; }
