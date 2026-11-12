@@ -34,7 +34,7 @@
 using Microsoft::WRL::ComPtr;
 
 constexpr wchar_t kAppName[] = L"Tryflake";
-constexpr wchar_t kAppVersion[] = L"1.0";
+constexpr wchar_t kAppVersion[] = L"1.0.1";
 
 // Сообщения главного скрытого окна.
 constexpr UINT WM_APP_TRAY = WM_APP + 1;
