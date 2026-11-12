@@ -73,9 +73,7 @@ SettingsPanel::SettingsPanel(GpuContext& gpu, SettingsStore& store, PanelActions
 }
 
 SettingsPanel::~SettingsPanel() {
-    releaseTargets();
-    dc_.Reset();
-    swapChain_.Reset();
+    releaseDevice();
     if (hwnd_) {
         SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
         DestroyWindow(hwnd_);
@@ -104,6 +102,21 @@ void SettingsPanel::releaseTargets() {
     previewBitmap_.Reset();
     previewRTV_.Reset();
     previewTexture_.Reset();
+}
+
+// Полный сброс всего, что создано на устройстве: следующий render() построит заново.
+void SettingsPanel::releaseDevice() {
+    releaseTargets();
+    previewGradient_.Reset();
+    previewWave_.Reset();
+    previewClip_.Reset();
+    previewX_ = previewY_ = -1;
+    brush_.Reset();
+    dash_.Reset();
+    round_.Reset();
+    dc_.Reset();
+    swapChain_.Reset();
+    pixelWidth_ = pixelHeight_ = 0;
 }
 
 bool SettingsPanel::ensureTargets() {
@@ -167,13 +180,20 @@ bool SettingsPanel::ensureTargets() {
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         if (SUCCEEDED(gpu_.device->CreateTexture2D(&desc, nullptr, &previewTexture_))) {
-            gpu_.device->CreateRenderTargetView(previewTexture_.Get(), nullptr, &previewRTV_);
             ComPtr<IDXGISurface> surface;
-            previewTexture_.As(&surface);
             const auto props = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
                 dpi, dpi);
-            dc_->CreateBitmapFromDxgiSurface(surface.Get(), &props, &previewBitmap_);
+            const bool ok =
+                SUCCEEDED(gpu_.device->CreateRenderTargetView(previewTexture_.Get(), nullptr, &previewRTV_)) &&
+                SUCCEEDED(previewTexture_.As(&surface)) &&
+                SUCCEEDED(dc_->CreateBitmapFromDxgiSurface(surface.Get(), &props, &previewBitmap_));
+            if (!ok) {
+                // Повторим попытку при следующем кадре.
+                previewBitmap_.Reset();
+                previewRTV_.Reset();
+                previewTexture_.Reset();
+            }
         }
     }
     dc_->SetTarget(target_.Get());
@@ -186,6 +206,20 @@ bool SettingsPanel::ensureTargets() {
 void SettingsPanel::show(const RECT& anchor) {
     if (!ensureWindow()) return;
     anchor_ = anchor;
+    place(true);
+    SetForegroundWindow(hwnd_);
+    SetFocus(hwnd_);
+    focus_ = None;
+    focusVisible_ = false;
+    lastPreviewFrame_ = 0;
+    previewTime_ = 0;
+    render();
+}
+
+// Размер и положение по anchor_ (над треем или под ним); общая логика для show() и смены DPI.
+void SettingsPanel::place(bool show) {
+    placing_ = true;
+    const RECT anchor = anchor_;
     HMONITOR monitor = MonitorFromRect(&anchor, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(monitor, &mi);
@@ -210,14 +244,8 @@ void SettingsPanel::show(const RECT& anchor) {
     // Панель задач сверху — открываемся вниз, иначе над панелью задач (как флайауты Windows 11).
     const bool taskbarTop = anchor.bottom <= work.top + 2;
     const int y = taskbarTop ? work.top + margin : work.bottom - margin - h;
-    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
-    SetForegroundWindow(hwnd_);
-    SetFocus(hwnd_);
-    focus_ = None;
-    focusVisible_ = false;
-    lastPreviewFrame_ = 0;
-    previewTime_ = 0;
-    render();
+    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h, show ? SWP_SHOWWINDOW : SWP_NOACTIVATE);
+    placing_ = false;
 }
 
 void SettingsPanel::hide() {
@@ -225,6 +253,11 @@ void SettingsPanel::hide() {
     if (GetCapture() == hwnd_) ReleaseCapture();
     pressed_ = None;
     hover_ = None;
+    if (tracking_) {
+        TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE | TME_CANCEL, hwnd_, 0};
+        TrackMouseEvent(&tme);
+        tracking_ = false;
+    }
     ShowWindow(hwnd_, SW_HIDE);
     hiddenAt_ = nowSeconds();
 }
@@ -257,13 +290,26 @@ void SettingsPanel::resizeToContent() {
     viewHeight_ = wanted;
     scroll_ = std::clamp(scroll_, 0.0f, std::max(0.0f, contentHeight_ - viewHeight_));
     SetWindowPos(hwnd_, nullptr, rc.left, y, rc.right - rc.left, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    if (updateHover()) render();
+}
+
+// Пересчитать hover по текущему положению курсора (после прокрутки или смены размера).
+bool SettingsPanel::updateHover() {
+    if (!visible() || pressed_ != None) return false;
+    POINT pt;
+    RECT client;
+    Id h = None;
+    if (GetCursorPos(&pt) && ScreenToClient(hwnd_, &pt) && GetClientRect(hwnd_, &client) && PtInRect(&client, pt))
+        h = hit(toContent(pt));
+    if (h == hover_) return false;
+    hover_ = h;
+    return true;
 }
 
 // ================================================================= отрисовка
 
 void SettingsPanel::render() {
     if (!visible() || !ensureTargets()) return;
-    store_.updateEnergyState();
     if (previewWorld_ && previewRTV_) {
         auto config = store_.configuration();
         config.maxDepth = 7;
@@ -285,14 +331,21 @@ void SettingsPanel::render() {
         const float track = viewHeight_ - 16;
         const float thumb = std::max(24.0f, track * viewHeight_ / contentHeight_);
         const float pos = 8 + (track - thumb) * (scroll_ / std::max(1.0f, contentHeight_ - viewHeight_));
-        fill(RectF(kWidth - 6, pos, kWidth - 3, pos + thumb), 1.5f, white(0.25f));
+        // Рисуем напрямую: после layout(true) g_paint уже false.
+        brush_->SetColor(white(0.25f));
+        dc_->FillRoundedRectangle(D2D1::RoundedRect(RectF(kWidth - 6, pos, kWidth - 3, pos + thumb), 1.5f, 1.5f),
+                                  brush_.Get());
     }
     const HRESULT hr = dc_->EndDraw();
     if (hr == D2DERR_RECREATE_TARGET) {
-        releaseTargets();
+        releaseDevice();
         return;
     }
-    swapChain_->Present(0, 0);
+    const HRESULT present = swapChain_->Present(0, 0);
+    if (present == DXGI_ERROR_DEVICE_REMOVED || present == DXGI_ERROR_DEVICE_RESET) {
+        releaseDevice();
+        return;
+    }
     if (std::abs(height - contentHeight_) > 0.5f) {
         contentHeight_ = height;
         resizeToContent();
@@ -458,33 +511,40 @@ void SettingsPanel::button(Id id, D2D1_RECT_F r, wchar_t icon, const std::wstrin
 
 void SettingsPanel::preview(D2D1_RECT_F r) {
     if (!g_paint) return;
-    ComPtr<ID2D1RoundedRectangleGeometry> clip;
-    gpu_.d2dFactory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(r, 14, 14), &clip);
-    dc_->PushLayer(D2D1::LayerParameters1(D2D1::InfiniteRect(), clip.Get()), nullptr);
-    // фон «рабочего стола»
-    ComPtr<ID2D1GradientStopCollection> stops;
-    const D2D1_GRADIENT_STOP gs[2] = {{0, rgba(0.09f, 0.17f, 0.19f)}, {1, rgba(0.14f, 0.23f, 0.23f)}};
-    dc_->CreateGradientStopCollection(gs, 2, &stops);
-    ComPtr<ID2D1LinearGradientBrush> gradient;
-    dc_->CreateLinearGradientBrush(
-        D2D1::LinearGradientBrushProperties(Point2F(r.left, r.top), Point2F(r.right, r.bottom)), stops.Get(), &gradient);
-    dc_->FillRectangle(r, gradient.Get());
     const float ox = r.left, oy = r.top;
-    {
-        ComPtr<ID2D1PathGeometry> wave;
-        gpu_.d2dFactory->CreatePathGeometry(&wave);
-        ComPtr<ID2D1GeometrySink> sink;
-        wave->Open(&sink);
-        sink->BeginFigure(Point2F(ox, oy + 130), D2D1_FIGURE_BEGIN_FILLED);
-        sink->AddBezier(D2D1::BezierSegment(Point2F(ox + 150, oy + 28), Point2F(ox + 210, oy + 170),
-                                            Point2F(ox + 340, oy + 93)));
-        sink->AddLine(Point2F(ox + 340, oy + 144));
-        sink->AddLine(Point2F(ox, oy + 144));
-        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-        sink->Close();
-        brush_->SetColor(white(0.035f));
-        dc_->FillGeometry(wave.Get(), brush_.Get());
+    if (!previewClip_ || !previewGradient_ || !previewWave_ || previewX_ != ox || previewY_ != oy) {
+        previewClip_.Reset();
+        previewGradient_.Reset();
+        previewWave_.Reset();
+        gpu_.d2dFactory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(r, 14, 14), &previewClip_);
+        ComPtr<ID2D1GradientStopCollection> stops;
+        const D2D1_GRADIENT_STOP gs[2] = {{0, rgba(0.09f, 0.17f, 0.19f)}, {1, rgba(0.14f, 0.23f, 0.23f)}};
+        dc_->CreateGradientStopCollection(gs, 2, &stops);
+        if (stops)
+            dc_->CreateLinearGradientBrush(
+                D2D1::LinearGradientBrushProperties(Point2F(r.left, r.top), Point2F(r.right, r.bottom)), stops.Get(),
+                &previewGradient_);
+        if (SUCCEEDED(gpu_.d2dFactory->CreatePathGeometry(&previewWave_))) {
+            ComPtr<ID2D1GeometrySink> sink;
+            if (SUCCEEDED(previewWave_->Open(&sink))) {
+                sink->BeginFigure(Point2F(ox, oy + 130), D2D1_FIGURE_BEGIN_FILLED);
+                sink->AddBezier(D2D1::BezierSegment(Point2F(ox + 150, oy + 28), Point2F(ox + 210, oy + 170),
+                                                    Point2F(ox + 340, oy + 93)));
+                sink->AddLine(Point2F(ox + 340, oy + 144));
+                sink->AddLine(Point2F(ox, oy + 144));
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->Close();
+            }
+        }
+        previewX_ = ox;
+        previewY_ = oy;
     }
+    if (!previewClip_ || !previewGradient_ || !previewWave_) return;
+    dc_->PushLayer(D2D1::LayerParameters1(D2D1::InfiniteRect(), previewClip_.Get()), nullptr);
+    // фон «рабочего стола»
+    dc_->FillRectangle(r, previewGradient_.Get());
+    brush_->SetColor(white(0.035f));
+    dc_->FillGeometry(previewWave_.Get(), brush_.Get());
     const std::wstring label = store_.enabled ? (store_.paused ? L"ЗИМА НА ПАУЗЕ" : L"ВАШ РАБОЧИЙ СТОЛ") : L"СНЕГ ВЫКЛЮЧЕН";
     text(label, RectF(ox + 13, oy + 11, ox + 300, oy + 26), 9, DWRITE_FONT_WEIGHT_SEMI_BOLD, white(0.5f),
          DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, 1.5f);
@@ -753,7 +813,16 @@ const SettingsPanel::Region* SettingsPanel::region(Id id) const {
 
 SettingsPanel::Id SettingsPanel::hit(D2D1_POINT_2F p) const {
     for (auto it = regions_.rbegin(); it != regions_.rend(); ++it)
-        if (contains(it->rect, p)) return it->enabled ? it->id : None;
+        if (contains(it->rect, p)) {
+            if (it->id == Dial) {
+                // Циферблат круглый: углы квадрата не считаются.
+                const float rad = (it->rect.right - it->rect.left) / 2;
+                const float dx = p.x - (it->rect.left + it->rect.right) / 2;
+                const float dy = p.y - (it->rect.top + it->rect.bottom) / 2;
+                if (dx * dx + dy * dy > rad * rad) continue;
+            }
+            return it->enabled ? it->id : None;
+        }
     return None;
 }
 
@@ -761,12 +830,18 @@ D2D1_POINT_2F SettingsPanel::toContent(LPARAM lParam) const {
     return Point2F(GET_X_LPARAM(lParam) / scale_, GET_Y_LPARAM(lParam) / scale_ + scroll_);
 }
 
+D2D1_POINT_2F SettingsPanel::toContent(POINT p) const { return Point2F(p.x / scale_, p.y / scale_ + scroll_); }
+
 void SettingsPanel::notify() {
-    if (actions_.changed) actions_.changed();
-    render();
+    // App::applySettings сам вызывает refresh() панели; без колбэка рисуем сами.
+    if (actions_.changed)
+        actions_.changed();
+    else
+        render();
 }
 
 void SettingsPanel::activate(Id id) {
+    if (const Region* r = region(id); r && !r->enabled) return;
     auto& p = store_.prefs;
     switch (id) {
         case Enable: store_.enabled = !store_.enabled; break;
@@ -863,11 +938,10 @@ LRESULT SettingsPanel::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             if (visible()) render();
             return 0;
         case WM_DPICHANGED: {
-            releaseTargets();
-            scale_ = HIWORD(wParam) / 96.0f;
-            const RECT* r = reinterpret_cast<const RECT*>(lParam);
-            SetWindowPos(hwnd_, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
+            // Предложенный системой rect не применяем: пересчитываем размер и позицию от anchor_.
+            if (placing_ || !visible()) return 0;
+            place(false);
+            render();
             return 0;
         }
         case WM_MOUSEMOVE: {
@@ -933,6 +1007,7 @@ LRESULT SettingsPanel::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             const float next = std::clamp(scroll_ - delta, 0.0f, std::max(0.0f, contentHeight_ - viewHeight_));
             if (next != scroll_) {
                 scroll_ = next;
+                updateHover();
                 render();
             }
             return 0;
@@ -944,6 +1019,7 @@ LRESULT SettingsPanel::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 case VK_TAB: moveFocus(GetKeyState(VK_SHIFT) < 0 ? -1 : 1); return 0;
                 case VK_SPACE:
                 case VK_RETURN:
+                    if (lParam & (1 << 30)) return 0;  // автоповтор клавиши
                     if (focus_ == Dial && wParam == VK_SPACE) {
                         store_.prefs.wind = Point();
                         notify();

@@ -4,11 +4,17 @@ namespace {
 
 using D2D1::Point2F;
 
+// Стиль штриха кэшируется; держим ссылку на фабрику, чтобы кэш не пережил её подмену.
 ComPtr<ID2D1StrokeStyle> roundStroke(ID2D1Factory* factory) {
+    static ComPtr<ID2D1Factory> cachedFactory;
+    static ComPtr<ID2D1StrokeStyle> cached;
+    if (cached && cachedFactory.Get() == factory) return cached;
     ComPtr<ID2D1StrokeStyle> style;
     D2D1_STROKE_STYLE_PROPERTIES p = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
                                                                  D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND);
-    factory->CreateStrokeStyle(p, nullptr, 0, &style);
+    if (FAILED(factory->CreateStrokeStyle(p, nullptr, 0, &style))) return nullptr;
+    cachedFactory = factory;
+    cached = style;
     return style;
 }
 
@@ -160,7 +166,7 @@ HICON Icons::makeTrayIcon(ID2D1Factory* factory, IWICImagingFactory* wic, int si
     const float s = static_cast<float>(size);
     Icons::draw(rt.Get(), factory, Kind::snowflake, D2D1::Point2F(s / 2, s / 2), s * 0.9f, brush.Get(),
                 std::max(1.0f, s / 14.0f));
-    rt->EndDraw();
+    if (FAILED(rt->EndDraw())) return nullptr;
 
     // Иконке нужен непремультиплицированный BGRA.
     std::vector<uint8_t> pixels(static_cast<size_t>(size) * size * 4);
@@ -168,7 +174,7 @@ HICON Icons::makeTrayIcon(ID2D1Factory* factory, IWICImagingFactory* wic, int si
     for (size_t i = 0; i < pixels.size(); i += 4) {
         const uint8_t a = pixels[i + 3];
         if (a > 0 && a < 255) {
-            for (int k = 0; k < 3; ++k) pixels[i + k] = static_cast<uint8_t>(std::min(255, pixels[i + k] * 255 / a));
+            for (int k = 0; k < 3; ++k) pixels[i + k] = static_cast<uint8_t>(std::min(255, (pixels[i + k] * 255 + a / 2) / a));
         }
     }
     BITMAPV5HEADER header{};

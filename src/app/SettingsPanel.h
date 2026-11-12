@@ -49,6 +49,9 @@ private:
     bool ensureWindow();
     bool ensureTargets();
     void releaseTargets();
+    void releaseDevice();
+    void place(bool show);
+    bool updateHover();
     void render();
     float layout(bool paint);
     void resizeToContent();
@@ -57,6 +60,7 @@ private:
     Id hit(D2D1_POINT_2F p) const;
     const Region* region(Id id) const;
     D2D1_POINT_2F toContent(LPARAM lParam) const;
+    D2D1_POINT_2F toContent(POINT clientPoint) const;
     void moveFocus(int direction);
     void notify();
 
@@ -101,6 +105,11 @@ private:
     ComPtr<ID3D11Texture2D> previewTexture_;
     ComPtr<ID3D11RenderTargetView> previewRTV_;
     ComPtr<ID2D1Bitmap1> previewBitmap_;
+    // кэш объектов превью (пересоздаются вместе с контекстом)
+    ComPtr<ID2D1LinearGradientBrush> previewGradient_;
+    ComPtr<ID2D1PathGeometry> previewWave_;
+    ComPtr<ID2D1RoundedRectangleGeometry> previewClip_;
+    float previewX_ = -1, previewY_ = -1;
     double previewTime_ = 0;
     double lastPreviewFrame_ = 0;
 
@@ -110,6 +119,7 @@ private:
     bool focusVisible_ = false;
     bool expanded_ = false;
     bool tracking_ = false;
+    bool placing_ = false;
     float scroll_ = 0, contentHeight_ = 0, viewHeight_ = 0, maxHeight_ = 0;
     double hiddenAt_ = 0;
     RECT anchor_{};
