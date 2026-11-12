@@ -117,6 +117,11 @@ void SettingsPanel::releaseDevice() {
     dc_.Reset();
     swapChain_.Reset();
     pixelWidth_ = pixelHeight_ = 0;
+    // Без Flush драйвер держит буферы удалённой цепочки, и CreateSwapChainForHwnd на том же HWND даёт E_ACCESSDENIED.
+    if (gpu_.context) {
+        gpu_.context->ClearState();
+        gpu_.context->Flush();
+    }
 }
 
 bool SettingsPanel::ensureTargets() {

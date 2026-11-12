@@ -28,6 +28,7 @@ private:
     void frame();
     void updatePacing();
     void handleDeviceLost();
+    static bool hardwareAvailable();
     void showPanel();
     void showMenu(int x, int y);
     void addTrayIcon();
@@ -55,6 +56,11 @@ private:
     bool rebuildPending_ = false;
     double nextFrame_ = 0;
     double lastWarpRetry_ = 0;
+    // Backoff пересоздания устройств, пустых оверлеев и повтора NIM_ADD (секунды монотонного времени).
+    bool needRecovery_ = false;
+    double nextRecovery_ = 0, recoveryDelay_ = 0.5, lastRecovery_ = -1000;
+    double nextRebuild_ = 0, rebuildDelay_ = 0.5;
+    double nextTrayAdd_ = 0;
     double lastTraySelect_ = 0;
     // Кэш последнего значка трея: пересоздаём только при реальной смене.
     UINT trayDpi_ = 0;

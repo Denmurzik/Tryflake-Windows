@@ -47,6 +47,27 @@ std::wstring exeCommand() {
     return L"\"" + std::wstring(path) + L"\"";
 }
 
+// Значение Run: REG_SZ или REG_EXPAND_SZ (переменные окружения RegGetValue раскрывает сам).
+bool readRunValue(std::wstring& out) {
+    wchar_t buffer[1024];
+    DWORD size = sizeof(buffer);
+    if (RegGetValueW(HKEY_CURRENT_USER, kRunKey, kAppName, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, buffer,
+                     &size) != ERROR_SUCCESS)
+        return false;
+    out = buffer;
+    return true;
+}
+
+// Файл, на который указывает команда Run (путь в кавычках, возможны аргументы).
+bool runTargetExists(const std::wstring& command) {
+    std::wstring path = command;
+    if (!path.empty() && path[0] == L'\"') {
+        const size_t end = path.find(L'\"', 1);
+        path = path.substr(1, end == std::wstring::npos ? std::wstring::npos : end - 1);
+    }
+    return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
 bool writeRunValue() {
     HKEY key;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
@@ -72,10 +93,10 @@ void SettingsStore::load() {
     p.allScreens = readDword(L"AllScreens", 1) != 0;
     p.energyAware = readDword(L"EnergyAware", 1) != 0;
     prefs = p;
-    // Папку с программой могли переместить: запись автозапуска чиним под текущий exe.
+    // Папку с программой могли переместить: запись чиним только если файл по сохранённому пути исчез.
+    // Запуск другой копии (сборка, Downloads) чужую рабочую запись не трогает.
     std::wstring value;
-    if (readString(HKEY_CURRENT_USER, kRunKey, kAppName, value) && _wcsicmp(value.c_str(), exeCommand().c_str()) != 0)
-        writeRunValue();
+    if (readRunValue(value) && !runTargetExists(value)) writeRunValue();
     refreshLogin();
 }
 
@@ -126,9 +147,9 @@ bool SettingsStore::updateEnergyState() {
 }
 
 void SettingsStore::refreshLogin() {
+    // loginEnabled: запись Run есть и указывает на существующий exe (не обязательно на эту копию).
     std::wstring value;
-    loginEnabled = readString(HKEY_CURRENT_USER, kRunKey, kAppName, value) &&
-                   _wcsicmp(value.c_str(), exeCommand().c_str()) == 0;
+    loginEnabled = readRunValue(value) && runTargetExists(value);
 }
 
 void SettingsStore::setLoginEnabled(bool enable) {

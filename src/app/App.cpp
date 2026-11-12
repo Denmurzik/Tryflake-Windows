@@ -124,6 +124,9 @@ int App::run(bool showSettings, bool smokeTest) {
     if (pacer_.joinable()) pacer_.join();
     CloseHandle(tickEvent_);
     CloseHandle(activeEvent_);
+    overlays_.clear();
+    panel_.reset();
+    Icons::releaseCache();
     gpu_.destroy();  // все COM-объекты освобождаются до CoUninitialize
     return static_cast<int>(msg.wParam);
 }
@@ -201,16 +204,40 @@ void App::frame() {
     if (!ok || gpu_.deviceLost()) handleDeviceLost();
 }
 
+// Пересоздание устройств с экспоненциальным backoff (0.5 → 1 → 2 … 60 с):
+// повторная потеря сразу после восстановления или неудача createDevices не крутят полную инициализацию.
 void App::handleDeviceLost() {
+    const double now = nowSeconds();
+    if (now < nextRecovery_) return;
+    const bool wasVisible = panel_ && panel_->visible();
     overlays_.clear();
     panel_.reset();
+    Icons::releaseCache();
     gpu_.destroy();
     if (!createDevices()) {
-        MessageBoxW(nullptr, store_.errorMessage.c_str(), kAppName, MB_ICONERROR);
-        DestroyWindow(hwnd_);
+        // Транзитный сбой (перезапуск dwm.exe, смена RDP-сессии) не должен убивать приложение.
+        needRecovery_ = true;
+        recoveryDelay_ = std::min(60.0, recoveryDelay_ * 2);
+        nextRecovery_ = now + recoveryDelay_;
         return;
     }
+    needRecovery_ = false;
+    if (now - lastRecovery_ < 30) {
+        recoveryDelay_ = std::min(60.0, recoveryDelay_ * 2);
+        nextRecovery_ = now + recoveryDelay_;
+    } else {
+        recoveryDelay_ = 0.5;
+        nextRecovery_ = 0;
+    }
+    lastRecovery_ = now;
     rebuildOverlays();
+    if (wasVisible) showPanel();
+}
+
+// Дешёвая проба: доступен ли аппаратный адаптер (устройство не создаётся).
+bool App::hardwareAvailable() {
+    return SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                       nullptr, 0, D3D11_SDK_VERSION, nullptr, nullptr, nullptr));
 }
 
 // ================================================================= состояние
@@ -293,7 +320,8 @@ void App::addTrayIcon() {
     updateTrayIcon();
     nid.hIcon = trayIcon_ ? trayIcon_ : LoadIconW(instance_, MAKEINTRESOURCEW(1));
     wcscpy_s(nid.szTip, L"Tryflake — снег на рабочем столе");
-    trayAdded_ = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
+    // NIM_ADD мог вернуть FALSE по таймауту Explorer, хотя значок уже добавлен: NIM_MODIFY это проверяет.
+    trayAdded_ = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE || Shell_NotifyIconW(NIM_MODIFY, &nid) != FALSE;
     nid.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &nid);
 }
@@ -408,31 +436,52 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             switch (wParam) {
                 case kTimerTrack: {
                     const double now = nowSeconds();
-                    if (!trayAdded_) addTrayIcon();
-                    // Потеря устройства (в т.ч. DComp) и пустые оверлеи после неё.
-                    if (gpu_.deviceLost()) {
-                        handleDeviceLost();
-                        return 0;
+                    if (!trayAdded_ && now >= nextTrayAdd_) {
+                        addTrayIcon();
+                        if (!trayAdded_) nextTrayAdd_ = now + 5;
                     }
-                    // WARP: раз в минуту пробуем вернуться на аппаратный адаптер.
-                    if (gpu_.warp) {
-                        if (lastWarpRetry_ == 0) lastWarpRetry_ = now;
-                        if (now - lastWarpRetry_ > 60) {
-                            lastWarpRetry_ = now;
-                            handleDeviceLost();
-                            return 0;
-                        }
-                    } else {
-                        lastWarpRetry_ = 0;
-                    }
-                    if (store_.enabled && !sleeping() && overlays_.empty() && gpu_.alive()) rebuildOverlays();
                     // Полный экран D3D / режим презентации: снег скрыт, поверх ничего не поднимаем.
+                    // Проверяем до пересборок ниже, чтобы они видели актуальное sleeping().
                     QUERY_USER_NOTIFICATION_STATE qstate = QUNS_ACCEPTS_NOTIFICATIONS;
                     if (SUCCEEDED(SHQueryUserNotificationState(&qstate))) {
                         const bool fs = qstate == QUNS_RUNNING_D3D_FULL_SCREEN || qstate == QUNS_PRESENTATION_MODE;
                         if (fs != fullscreen_) {
                             fullscreen_ = fs;
                             applySettings();
+                        }
+                    }
+                    // Потеря устройства (в т.ч. DComp). При сне/блокировке не проверяем: после пробуждения
+                    // пересборка уже запланирована.
+                    if (!suspended_ && !displayOff_ && !locked_ && (needRecovery_ || gpu_.deviceLost())) {
+                        handleDeviceLost();
+                        return 0;
+                    }
+                    // WARP: раз в минуту пробуем вернуться на аппаратный адаптер, но только если он
+                    // доступен, и не при открытой панели или перетаскивании снежка.
+                    if (gpu_.warp) {
+                        if (lastWarpRetry_ == 0) lastWarpRetry_ = now;
+                        bool busy = sleeping() || (panel_ && panel_->visible());
+                        for (const auto& o : overlays_) busy = busy || o->dragging();
+                        if (now - lastWarpRetry_ > 60 && !busy) {
+                            lastWarpRetry_ = now;
+                            if (hardwareAvailable()) {
+                                recoveryDelay_ = 0.5;
+                                nextRecovery_ = 0;
+                                handleDeviceLost();
+                                return 0;
+                            }
+                        }
+                    } else {
+                        lastWarpRetry_ = 0;
+                    }
+                    // Пустые оверлеи при живом устройстве: пересборка с backoff.
+                    if (store_.enabled && !sleeping() && overlays_.empty() && gpu_.alive() && now >= nextRebuild_) {
+                        rebuildOverlays();
+                        if (overlays_.empty()) {
+                            rebuildDelay_ = std::min(60.0, rebuildDelay_ * 2);
+                            nextRebuild_ = now + rebuildDelay_;
+                        } else {
+                            rebuildDelay_ = 0.5;
                         }
                     }
                     // Смена мониторов или DPI (у скрытого окна WM_DPICHANGED не приходит).
@@ -455,6 +504,8 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 case kTimerRebuild:
                     KillTimer(hwnd_, kTimerRebuild);
                     rebuildPending_ = false;
+                    nextRebuild_ = 0;
+                    rebuildDelay_ = 0.5;
                     rebuildOverlays();
                     return 0;
                 case kTimerShow:

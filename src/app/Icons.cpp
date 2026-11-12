@@ -5,9 +5,11 @@ namespace {
 using D2D1::Point2F;
 
 // Стиль штриха кэшируется; держим ссылку на фабрику, чтобы кэш не пережил её подмену.
+// Кэш пустеет в Icons::releaseCache() до CoUninitialize, статический деструктор держит уже null.
+ComPtr<ID2D1Factory> cachedFactory;
+ComPtr<ID2D1StrokeStyle> cached;
+
 ComPtr<ID2D1StrokeStyle> roundStroke(ID2D1Factory* factory) {
-    static ComPtr<ID2D1Factory> cachedFactory;
-    static ComPtr<ID2D1StrokeStyle> cached;
     if (cached && cachedFactory.Get() == factory) return cached;
     ComPtr<ID2D1StrokeStyle> style;
     D2D1_STROKE_STYLE_PROPERTIES p = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
@@ -56,6 +58,11 @@ ComPtr<ID2D1PathGeometry> cloud(ID2D1Factory* factory, D2D1_POINT_2F c, float s)
 }
 
 }  // namespace
+
+void Icons::releaseCache() {
+    cached.Reset();
+    cachedFactory.Reset();
+}
 
 void Icons::draw(ID2D1RenderTarget* rt, ID2D1Factory* factory, Kind kind, D2D1_POINT_2F c, float s, ID2D1Brush* b,
                  float w) {

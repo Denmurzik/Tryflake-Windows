@@ -63,7 +63,7 @@ Overlay::Overlay(GpuContext& gpu, SettingsStore& settings, const MonitorInfo& mo
     visual_->SetContent(swapChain_.Get());
     target_->SetRoot(visual_.Get());
     gpu_.dcomp->Commit();
-    applySettings(false);
+    // Показ и Z-порядок задаёт App через applySettings(sleeping()): в полноэкранном режиме окно не поднимаем.
 }
 
 Overlay::~Overlay() {
@@ -173,7 +173,15 @@ void Overlay::setClickThrough(bool through) {
     SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex);
     // Курсор не двигался — Windows сам не пошлёт WM_SETCURSOR, поэтому обновляем вручную.
     POINT cursor{};
-    if (GetCursorPos(&cursor) && WindowFromPoint(cursor) == hwnd_) SendMessageW(hwnd_, WM_SETCURSOR, reinterpret_cast<WPARAM>(hwnd_), MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+    if (!GetCursorPos(&cursor)) return;
+    if (!through) {
+        if (WindowFromPoint(cursor) == hwnd_)
+            SendMessageW(hwnd_, WM_SETCURSOR, reinterpret_cast<WPARAM>(hwnd_), MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+    } else if (cursor.x >= monitor_.px.x && cursor.x < monitor_.px.x + monitor_.px.width && cursor.y >= monitor_.px.y &&
+               cursor.y < monitor_.px.y + monitor_.px.height) {
+        // Оверлей уже прозрачен для WindowFromPoint: сбрасываем «руку» на стрелку до следующего движения мыши.
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+    }
 }
 
 Point Overlay::toLocal(LPARAM lParam) const {

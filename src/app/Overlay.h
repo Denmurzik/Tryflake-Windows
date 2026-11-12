@@ -23,6 +23,7 @@ public:
     void updateSnapshot(const DesktopSnapshot& snapshot);
     /// Шаг симуляции и кадр. false — устройство потеряно.
     bool frame(double now);
+    bool dragging() const { return dragging_; }
     bool animating() const { return visible_ && !settings_.paused; }
     void clear();
     void seed();
