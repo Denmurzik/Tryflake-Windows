@@ -47,6 +47,17 @@ std::wstring exeCommand() {
     return L"\"" + std::wstring(path) + L"\"";
 }
 
+bool writeRunValue() {
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return false;
+    const std::wstring command = exeCommand();
+    const LSTATUS status = RegSetValueExW(key, kAppName, 0, REG_SZ, reinterpret_cast<const BYTE*>(command.c_str()),
+                                          static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(key);
+    return status == ERROR_SUCCESS;
+}
+
 }  // namespace
 
 void SettingsStore::load() {
@@ -61,6 +72,10 @@ void SettingsStore::load() {
     p.allScreens = readDword(L"AllScreens", 1) != 0;
     p.energyAware = readDword(L"EnergyAware", 1) != 0;
     prefs = p;
+    // Папку с программой могли переместить: запись автозапуска чиним под текущий exe.
+    std::wstring value;
+    if (readString(HKEY_CURRENT_USER, kRunKey, kAppName, value) && _wcsicmp(value.c_str(), exeCommand().c_str()) != 0)
+        writeRunValue();
     refreshLogin();
 }
 
@@ -112,12 +127,13 @@ bool SettingsStore::updateEnergyState() {
 
 void SettingsStore::refreshLogin() {
     std::wstring value;
-    loginEnabled = readString(HKEY_CURRENT_USER, kRunKey, kAppName, value);
+    loginEnabled = readString(HKEY_CURRENT_USER, kRunKey, kAppName, value) &&
+                   _wcsicmp(value.c_str(), exeCommand().c_str()) == 0;
 }
 
 void SettingsStore::setLoginEnabled(bool enable) {
     HKEY key;
-    LSTATUS status = RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key);
+    LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr);
     if (status == ERROR_SUCCESS) {
         if (enable) {
             const std::wstring command = exeCommand();

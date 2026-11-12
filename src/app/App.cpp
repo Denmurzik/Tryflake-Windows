@@ -35,6 +35,12 @@ bool lightTaskbar() {
     return value != 0;
 }
 
+UINT primaryDpi() {
+    UINT dpiX = 96, dpiY = 96;
+    GetDpiForMonitor(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
+    return dpiX;
+}
+
 using WaitForCompositorClock = DWORD(WINAPI*)(UINT, const HANDLE*, DWORD);
 
 }  // namespace
@@ -118,6 +124,7 @@ int App::run(bool showSettings, bool smokeTest) {
     if (pacer_.joinable()) pacer_.join();
     CloseHandle(tickEvent_);
     CloseHandle(activeEvent_);
+    gpu_.destroy();  // все COM-объекты освобождаются до CoUninitialize
     return static_cast<int>(msg.wParam);
 }
 
@@ -175,15 +182,18 @@ void App::updatePacing() {
         SetEvent(activeEvent_);
     } else {
         ResetEvent(activeEvent_);
-        lastFrame_ = 0;
+        nextFrame_ = 0;
     }
 }
 
 void App::frame() {
     const double now = nowSeconds();
-    const double interval = store_.economyActive ? 1.0 / 30 : 1.0 / 60;
-    if (lastFrame_ != 0 && now - lastFrame_ < interval - 0.003) return;
-    lastFrame_ = now;
+    const double interval = (store_.economyActive || gpu_.warp) ? 1.0 / 30 : 1.0 / 60;
+    // Накопитель дедлайна: на 75/90/120+ Гц кадры не теряются через один.
+    if (nextFrame_ == 0) nextFrame_ = now;
+    if (now + 0.003 < nextFrame_) return;
+    nextFrame_ += interval;
+    if (now - nextFrame_ > interval) nextFrame_ = now;
     if (windowsDirty_) refreshWindows();
     bool ok = true;
     for (auto& o : overlays_) ok = o->frame(now) && ok;
@@ -222,7 +232,25 @@ void App::rebuildOverlays() {
     }
     lastAllScreens_ = store_.prefs.allScreens;
     windowsDirty_ = false;
+    raisePanel();
     updatePacing();
+}
+
+void App::raisePanel() {
+    if (!panel_ || !panel_->visible()) return;
+    for (auto& o : overlays_) o->keepOnTop(panel_->hwnd());
+}
+
+bool App::monitorsChanged() const {
+    const auto now = WindowTracker::monitors();
+    if (now.size() != monitors_.size()) return true;
+    for (size_t i = 0; i < now.size(); ++i) {
+        const auto &a = now[i], &b = monitors_[i];
+        if (a.px.x != b.px.x || a.px.y != b.px.y || a.px.width != b.px.width || a.px.height != b.px.height ||
+            a.scale != b.scale)
+            return true;
+    }
+    return false;
 }
 
 void App::applySettings() {
@@ -230,6 +258,7 @@ void App::applySettings() {
     if (lastAllScreens_ != store_.prefs.allScreens) rebuildOverlays();
     for (auto& o : overlays_) o->applySettings(sleeping());
     updateTrayIcon();
+    raisePanel();
     if (panel_) panel_->refresh();
     if (!(store_.prefs == savedPrefs_)) SetTimer(hwnd_, kTimerSave, 250, nullptr);
     updatePacing();
@@ -265,12 +294,15 @@ void App::addTrayIcon() {
 }
 
 void App::updateTrayIcon() {
-    UINT dpiX = 96, dpiY = 96;
-    GetDpiForMonitor(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
-    const int size = GetSystemMetricsForDpi(SM_CXSMICON, dpiX);
-    HICON icon = Icons::makeTrayIcon(gpu_.d2dFactory.Get(), gpu_.wic.Get(), size, lightTaskbar(),
-                                     !store_.enabled || store_.paused);
+    const UINT dpi = primaryDpi();
+    const bool light = lightTaskbar(), dimmed = !store_.enabled || store_.paused;
+    if (trayIcon_ && dpi == trayDpi_ && light == trayLight_ && dimmed == trayDimmed_) return;
+    const int size = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+    HICON icon = Icons::makeTrayIcon(gpu_.d2dFactory.Get(), gpu_.wic.Get(), size, light, dimmed);
     if (!icon) return;
+    trayDpi_ = dpi;
+    trayLight_ = light;
+    trayDimmed_ = dimmed;
     if (trayAdded_) {
         NOTIFYICONDATAW nid{sizeof(nid)};
         nid.hWnd = hwnd_;
@@ -348,12 +380,17 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         case WM_APP_TRAY:
             switch (LOWORD(lParam)) {
                 case NIN_SELECT:
-                case NIN_KEYSELECT:
+                case NIN_KEYSELECT: {
+                    // NIN_SELECT и NIN_KEYSELECT иногда приходят парой: второй игнорируем.
+                    const double now = nowSeconds();
+                    if (now - lastTraySelect_ < 0.3) return 0;
+                    lastTraySelect_ = now;
                     if (panel_ && panel_->visible())
                         panel_->hide();
-                    else if (!panel_ || nowSeconds() - panel_->hiddenAt() > 0.3)
+                    else if (!panel_ || now - panel_->hiddenAt() > 0.3)
                         showPanel();
                     return 0;
+                }
                 case WM_CONTEXTMENU:
                     showMenu(GET_X_LPARAM(wParam), GET_Y_LPARAM(wParam));
                     return 0;
@@ -365,9 +402,45 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         case WM_TIMER:
             switch (wParam) {
                 case kTimerTrack: {
+                    const double now = nowSeconds();
+                    if (!trayAdded_) addTrayIcon();
+                    // Потеря устройства (в т.ч. DComp) и пустые оверлеи после неё.
+                    if (gpu_.deviceLost()) {
+                        handleDeviceLost();
+                        return 0;
+                    }
+                    // WARP: раз в минуту пробуем вернуться на аппаратный адаптер.
+                    if (gpu_.warp) {
+                        if (lastWarpRetry_ == 0) lastWarpRetry_ = now;
+                        if (now - lastWarpRetry_ > 60) {
+                            lastWarpRetry_ = now;
+                            handleDeviceLost();
+                            return 0;
+                        }
+                    } else {
+                        lastWarpRetry_ = 0;
+                    }
+                    if (store_.enabled && !sleeping() && overlays_.empty() && gpu_.alive()) rebuildOverlays();
+                    // Полный экран D3D / режим презентации: снег скрыт, поверх ничего не поднимаем.
+                    QUERY_USER_NOTIFICATION_STATE qstate = QUNS_ACCEPTS_NOTIFICATIONS;
+                    if (SUCCEEDED(SHQueryUserNotificationState(&qstate))) {
+                        const bool fs = qstate == QUNS_RUNNING_D3D_FULL_SCREEN || qstate == QUNS_PRESENTATION_MODE;
+                        if (fs != fullscreen_) {
+                            fullscreen_ = fs;
+                            applySettings();
+                        }
+                    }
+                    // Смена мониторов или DPI (у скрытого окна WM_DPICHANGED не приходит).
+                    if (!rebuildPending_ && monitorsChanged()) {
+                        rebuildPending_ = true;
+                        SetTimer(hwnd_, kTimerRebuild, 400, nullptr);
+                    }
+                    updateTrayIcon();  // кэш: пересоздаёт значок только при смене DPI/темы
                     refreshWindows();
-                    HWND panel = panel_ && panel_->visible() ? panel_->hwnd() : nullptr;
-                    for (auto& o : overlays_) o->keepOnTop(panel);
+                    if (!sleeping()) {
+                        HWND panel = panel_ && panel_->visible() ? panel_->hwnd() : nullptr;
+                        for (auto& o : overlays_) o->keepOnTop(panel);
+                    }
                     if (store_.updateEnergyState()) applySettings();
                     updatePacing();
                     return 0;
@@ -379,6 +452,7 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                     return 0;
                 case kTimerRebuild:
                     KillTimer(hwnd_, kTimerRebuild);
+                    rebuildPending_ = false;
                     rebuildOverlays();
                     return 0;
                 case kTimerShow:

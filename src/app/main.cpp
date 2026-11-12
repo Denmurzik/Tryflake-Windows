@@ -141,7 +141,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     // Один экземпляр: повторный запуск открывает настройки уже работающего.
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\Tryflake.SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (HWND existing = FindWindowW(L"TryflakeMain", nullptr)) {
+        // Первый экземпляр мог только что стартовать и ещё не создать окно: ждём до ~2 с.
+        HWND existing = nullptr;
+        for (int attempt = 0; attempt < 20 && !existing; ++attempt) {
+            existing = FindWindowW(L"TryflakeMain", nullptr);
+            if (!existing) Sleep(100);
+        }
+        if (existing) {
             DWORD pid = 0;
             GetWindowThreadProcessId(existing, &pid);
             AllowSetForegroundWindow(pid);
@@ -152,8 +158,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return 0;
     }
 
-    App app;
-    const int code = app.run(hasArg(argc, argv, L"--show-settings"), hasArg(argc, argv, L"--smoke-test"));
+    int code = 0;
+    {
+        // App (и все COM-объекты внутри) уничтожается до CoUninitialize.
+        App app;
+        code = app.run(hasArg(argc, argv, L"--show-settings"), hasArg(argc, argv, L"--smoke-test"));
+    }
     LocalFree(argv);
     if (mutex) {
         ReleaseMutex(mutex);

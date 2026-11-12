@@ -33,7 +33,9 @@ private:
     void addTrayIcon();
     void updateTrayIcon();
     RECT trayAnchor() const;
-    bool sleeping() const { return suspended_ || displayOff_ || locked_; }
+    bool sleeping() const { return suspended_ || displayOff_ || locked_ || fullscreen_; }
+    void raisePanel();
+    bool monitorsChanged() const;
     void pacingLoop();
 
     HINSTANCE instance_ = nullptr;
@@ -49,9 +51,15 @@ private:
     UINT taskbarCreated_ = 0;
     bool trayAdded_ = false;
     bool lastAllScreens_ = true;
-    bool suspended_ = false, displayOff_ = false, locked_ = false;
+    bool suspended_ = false, displayOff_ = false, locked_ = false, fullscreen_ = false;
+    bool rebuildPending_ = false;
+    double nextFrame_ = 0;
+    double lastWarpRetry_ = 0;
+    double lastTraySelect_ = 0;
+    // Кэш последнего значка трея: пересоздаём только при реальной смене.
+    UINT trayDpi_ = 0;
+    bool trayLight_ = false, trayDimmed_ = false;
     bool windowsDirty_ = false;
-    double lastFrame_ = 0;
     Preferences savedPrefs_;
 
     std::thread pacer_;
