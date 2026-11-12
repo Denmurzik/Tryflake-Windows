@@ -9,6 +9,11 @@ C++20, Win32, Direct3D 11, DirectComposition, Direct2D и DirectWrite.
 
 Windows 10 1903+ / Windows 11, x64.
 
+**[Скачать последнюю версию](https://github.com/Denmurzik/Tryflake-Windows/releases/latest/download/Tryflake.zip)**
+· [Все выпуски](https://github.com/Denmurzik/Tryflake-Windows/releases)
+
+![Снег на рабочем столе Windows: сугробы на окнах и панель настроек Tryflake](docs/assets/screenshot.png)
+
 ## Установка
 
 1. Распакуйте `Tryflake.zip` в любую папку, например `%LOCALAPPDATA%\Programs\Tryflake`.
