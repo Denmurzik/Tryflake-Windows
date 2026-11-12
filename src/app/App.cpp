@@ -237,8 +237,13 @@ void App::rebuildOverlays() {
 }
 
 void App::raisePanel() {
-    if (!panel_ || !panel_->visible()) return;
-    for (auto& o : overlays_) o->keepOnTop(panel_->hwnd());
+    HWND panel = panel_ && panel_->visible() ? panel_->hwnd() : nullptr;
+    // Цепочка: каждый оверлей встаёт под предыдущим, иначе при 2+ мониторах они меняются местами.
+    HWND below = panel;
+    for (auto& o : overlays_) {
+        o->keepOnTop(below);
+        below = o->hwnd();
+    }
 }
 
 bool App::monitorsChanged() const {
@@ -329,7 +334,7 @@ RECT App::trayAnchor() const {
 void App::showPanel() {
     if (!panel_) return;
     panel_->show(trayAnchor());
-    for (auto& o : overlays_) o->keepOnTop(panel_->hwnd());
+    raisePanel();
     updatePacing();
 }
 
@@ -437,10 +442,7 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                     }
                     updateTrayIcon();  // кэш: пересоздаёт значок только при смене DPI/темы
                     refreshWindows();
-                    if (!sleeping()) {
-                        HWND panel = panel_ && panel_->visible() ? panel_->hwnd() : nullptr;
-                        for (auto& o : overlays_) o->keepOnTop(panel);
-                    }
+                    if (!sleeping()) raisePanel();
                     if (store_.updateEnergyState()) applySettings();
                     updatePacing();
                     return 0;
