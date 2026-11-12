@@ -1,0 +1,5 @@
+build/
+upstream/
+*.obj
+*.pdb
+.team/
